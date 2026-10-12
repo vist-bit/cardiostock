@@ -8,12 +8,41 @@
 // специфікацією CORS, preflight не потрібен. На боці Apps Script (doPost)
 // тіло однаково парситься як JSON через JSON.parse(e.postData.contents),
 // незалежно від заявленого Content-Type.
+//
+// Усі запити, включно з читанням даних, ідуть через POST (doPost на сервері) —
+// жодного PIN у query-параметрі URL: URL-адреси осідають у логах Apps
+// Script/проксі-серверів і в історії браузера, тіло POST-запиту — ні.
 
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzgvDMVSdhULfVeBbHcgsCgweMhYNpN0UDX4vSdXotIME7DEGdHn3wwn2h4Y6vbsUydIg/exec';
+const APPS_SCRIPT_URL = 'ВСТАВТЕ_СЮДИ_URL_ВЛАСНОГО_ДЕПЛОЮ_ЩО_ЗАКІНЧУЄТЬСЯ_НА_/exec';
+
+/**
+ * Виконує дію на сервері — і читання ('getAll'), і запис (addStock,
+ * addOperation, saveMaterial, ...). pin — PIN поточного залогіненого
+ * користувача (sessionPin у App.jsx); сервер сам перевіряє права для
+ * кожної дії, це не просто UI-затвор.
+ *
+ * Повертає { success: true, data: {...} } або { success: false, error: '...' } —
+ * компоненти самі показують result.error через showMsg/alert.
+ * Мережеві збої (сервер недоступний) кидають Error з людяним повідомленням.
+ */
+async function callAction(action, payload, pin) {
+  let res;
+  try {
+    res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action, pin, payload })
+    });
+  } catch (networkErr) {
+    throw new Error("Немає з'єднання з сервером Apps Script.");
+  }
+  if (!res.ok) throw new Error('Мережева помилка: ' + res.status);
+  return res.json();
+}
 
 /**
  * Завантажує стан застосунку (materials, stock, operations, expenses,
- * subcategories, writeoffs, users) одним запитом.
+ * subcategories, writeoffs, users, templates, templateItems) одним запитом.
  *
  * pin — необов'язковий. Без нього сервер повертає "публічний" зріз (без
  * ІБ пацієнтів у operations, без PIN-кодів у users) — саме це вантажиться
@@ -25,40 +54,9 @@ const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzgvDMVSdhULfVe
  * сервер повернув success:false.
  */
 async function fetchAllData(pin) {
-  let res;
-  try {
-    const url = pin
-      ? `${APPS_SCRIPT_URL}?action=getAll&pin=${encodeURIComponent(pin)}`
-      : `${APPS_SCRIPT_URL}?action=getAll`;
-    res = await fetch(url);
-  } catch (networkErr) {
-    throw new Error("Немає з'єднання з сервером Apps Script.");
-  }
-  if (!res.ok) throw new Error('Мережева помилка: ' + res.status);
-
-  const json = await res.json();
+  const json = await callAction('getAll', {}, pin || '');
   if (!json.success) throw new Error(json.error || 'Невідома помилка сервера.');
   return json.data;
-}
-
-/**
- * Виконує дію запису на сервері (addStock, addOperation, saveMaterial, ...).
- * pin — PIN поточного залогіненого користувача (currentUser?.pin); сервер
- * сам перевіряє права для кожної дії, це не просто UI-затвор.
- *
- * Повертає { success: true, data: {...} } або { success: false, error: '...' } —
- * компоненти самі показують result.error через showMsg/alert, як і раніше.
- * Мережеві збої (сервер недоступний) прокидаються як виняток — лови їх у
- * викликаючому коді через try/catch, як у решті обробників форм.
- */
-async function callAction(action, payload, pin) {
-  const res = await fetch(APPS_SCRIPT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ action, pin, payload })
-  });
-  if (!res.ok) throw new Error('Мережева помилка: ' + res.status);
-  return res.json();
 }
 
 export { fetchAllData, callAction };
