@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   HeartPulse, ScanBarcode, PackagePlus, Activity, AlertTriangle, Database, Download, CheckCircle,
   X, Search, Trash2, Camera, Calendar, Filter, ArrowDownUp, Lock, Unlock, Edit2, Clock,
@@ -25,6 +25,53 @@ const genId = (prefix) => {
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   return `${prefix}_${uuid}`;
 };
+
+// Довжина PIN: сервер (Code.gs) приймає 4–6 цифр, тому екран входу теж.
+const PIN_MIN_LENGTH = 4;
+const PIN_MAX_LENGTH = 6;
+
+// Безпечне приведення до рядка. Google Таблиці можуть віддати "текстове" поле числом
+// (LOT 00123 → 123, цифровий код → число), а виклики на кшталт .toLowerCase() на числі
+// кидають TypeError і валять увесь інтерфейс.
+const str = (v) => (v === undefined || v === null) ? '' : String(v);
+
+// Приводить усі поля, які UI трактує як текст, до рядків одразу при завантаженні даних.
+const normalizeData = (data) => ({
+  materials: (data.materials || []).map(m => ({ ...m, name: str(m.name), code: str(m.code) })),
+  stock: (data.stock || []).map(s => ({ ...s, lot_number: str(s.lot_number), serial_number: str(s.serial_number), size: str(s.size) })),
+  operations: (data.operations || []).map(o => ({ ...o, operation_num: str(o.operation_num), patient_case_id: str(o.patient_case_id) })),
+  expenses: data.expenses || [],
+  subcategories: (data.subcategories || []).map(sc => ({ ...sc, name: str(sc.name) })),
+  writeoffs: data.writeoffs || [],
+  users: (data.users || []).map(u => ({ ...u, name: str(u.name), pin: str(u.pin) })),
+  templates: (data.templates || []).map(t => ({ ...t, name: str(t.name) })),
+  templateItems: data.templateItems || []
+});
+
+// Захист від "білого екрана": помилка рендеру всередині вкладки показує повідомлення
+// замість того, щоб знести весь застосунок. При зміні resetKey (вкладки) стан скидається.
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error('Помилка інтерфейсу:', error, info); }
+  componentDidUpdate(prevProps) {
+    if (this.state.error && prevProps.resetKey !== this.props.resetKey) this.setState({ error: null });
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="max-w-xl mx-auto bg-slate-900 border border-rose-900/50 rounded-3xl p-8 text-center space-y-4">
+        <AlertTriangle size={40} className="mx-auto text-rose-500" />
+        <p className="font-bold text-white">Сталася помилка в інтерфейсі.</p>
+        <p className="text-xs text-slate-400 break-words">{String((this.state.error && this.state.error.message) || this.state.error)}</p>
+        <div className="flex gap-3 justify-center">
+          <button onClick={() => this.setState({ error: null })} className="bg-slate-800 hover:bg-slate-700 text-white font-bold py-2.5 px-5 rounded-xl">Спробувати знову</button>
+          <button onClick={() => window.location.reload()} className="bg-teal-600 hover:bg-teal-500 text-white font-bold py-2.5 px-5 rounded-xl">Перезавантажити</button>
+        </div>
+      </div>
+    );
+  }
+}
 
 const parseBarcode = (code) => {
   let cleanCode = code.replace(/\\u001d|\\x1d|<GS>|\]d2/gi, String.fromCharCode(29));
@@ -71,14 +118,34 @@ const BarcodeScanner = ({ onScan, onClose }) => {
   const [error, setError] = useState('');
   const [isReady, setIsReady] = useState(false);
 
+  // Камера викликає callback на КОЖНОМУ кадрі, де бачить код, — до того, як clear() встигне
+  // її зупинити. Без захисту один скан обробляється двічі й у списанні стає +2 шт замість +1.
+  // handledRef пропускає лише перший виклик на одне відкриття сканера.
+  // onScan тримаємо в ref, щоб ефект ініціалізації камери не перезапускався на кожен ререндер батька.
+  const onScanRef = useRef(onScan);
+  const handledRef = useRef(false);
+  useEffect(() => { onScanRef.current = onScan; }, [onScan]);
+
+  const emitScan = useCallback((text) => {
+    if (handledRef.current) return false;
+    handledRef.current = true;
+    onScanRef.current(text);
+    return true;
+  }, []);
+
   useEffect(() => {
+    let cancelled = false;
     let html5QrcodeScanner;
     const initScanner = () => {
+      if (cancelled) return;
       setIsReady(true);
       try {
         html5QrcodeScanner = new window.Html5QrcodeScanner("reader", { fps: 30, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 }, false);
         html5QrcodeScanner.render(
-          (decodedText) => { onScan(decodedText); html5QrcodeScanner.clear(); },
+          (decodedText) => {
+            if (!emitScan(decodedText)) return; // повторний кадр з тим самим кодом — ігноруємо
+            try { html5QrcodeScanner.clear().catch(e => console.error(e)); } catch (e) { console.error(e); }
+          },
           (err) => {}
         );
       } catch (e) { setError("Не вдалося запустити камеру. Перевірте дозволи."); }
@@ -93,8 +160,13 @@ const BarcodeScanner = ({ onScan, onClose }) => {
       document.body.appendChild(script);
     } else { initScanner(); }
 
-    return () => { if (html5QrcodeScanner) html5QrcodeScanner.clear().catch(e => console.error(e)); };
-  }, [onScan]);
+    return () => {
+      cancelled = true;
+      if (html5QrcodeScanner) {
+        try { html5QrcodeScanner.clear().catch(e => console.error(e)); } catch (e) { console.error(e); }
+      }
+    };
+  }, [emitScan]);
 
   return (
     <div className="fixed inset-0 bg-slate-950/95 z-50 flex flex-col backdrop-blur-sm">
@@ -112,8 +184,8 @@ const BarcodeScanner = ({ onScan, onClose }) => {
              <div className="absolute bottom-2 left-2 right-2 bg-slate-950/90 p-3 rounded-xl text-xs text-center border border-slate-700 shadow-xl">
                 <p className="mb-2 font-bold text-teal-400">Емулятор сканера</p>
                 <div className="flex flex-col gap-2 justify-center">
-                    <button onClick={() => onScan('01008000000000011728120110LOT-ONX-A21\x1D21SN-998877')} className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg text-white font-bold transition-colors">Скан: On-X GS1</button>
-                    <button onClick={() => onScan('REF-CUSTOM-VALVE')} className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg text-white font-bold transition-colors">Скан: Невідомий артикул</button>
+                    <button onClick={() => emitScan('01008000000000011728120110LOT-ONX-A21\x1D21SN-998877')} className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg text-white font-bold transition-colors">Скан: On-X GS1</button>
+                    <button onClick={() => emitScan('REF-CUSTOM-VALVE')} className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg text-white font-bold transition-colors">Скан: Невідомий артикул</button>
                 </div>
              </div>
           </div>
@@ -376,7 +448,7 @@ const TemplateManagerModal = ({ state, dispatch, sessionPin, onClose }) => {
   const materialSuggestions = useMemo(() => {
     if (!materialSearch) return [];
     const q = materialSearch.toLowerCase();
-    return state.materials.filter(m => m.name.toLowerCase().includes(q) || m.code.toLowerCase().includes(q)).slice(0, 8);
+    return state.materials.filter(m => str(m.name).toLowerCase().includes(q) || str(m.code).toLowerCase().includes(q)).slice(0, 8);
   }, [materialSearch, state.materials]);
 
   const resetForm = () => {
@@ -762,7 +834,7 @@ const StockIn = ({ state, dispatch, sessionPin }) => {
     if (!searchQuery) return state.materials.slice(0, 10);
     const query = searchQuery.toLowerCase();
     return state.materials.filter(m =>
-      m.name.toLowerCase().includes(query) || m.code.toLowerCase().includes(query)
+      str(m.name).toLowerCase().includes(query) || str(m.code).toLowerCase().includes(query)
     ).slice(0, 10);
   }, [searchQuery, state.materials]);
 
@@ -1009,7 +1081,7 @@ const Inventory = ({ state, dispatch, isReadOnly, sessionPin }) => {
       if (filterCategory !== 'All' && mat.subcategory !== filterCategory) return;
       const batches = state.stock.filter(s => s.material_id === mat.id && s.quantity > 0);
       batches.forEach(b => {
-        if (mat.name.toLowerCase().includes(searchTerm.toLowerCase()) || b.lot_number.toLowerCase().includes(searchTerm.toLowerCase())) result.push({ ...mat, ...b, unique_id: b.id });
+        if (str(mat.name).toLowerCase().includes(searchTerm.toLowerCase()) || str(b.lot_number).toLowerCase().includes(searchTerm.toLowerCase())) result.push({ ...mat, ...b, unique_id: b.id });
       });
     });
     return result.sort((a, b) => {
@@ -1221,7 +1293,7 @@ const UsersManager = ({ state, dispatch, sessionPin }) => {
                <input type="text" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white outline-none" placeholder="Медсестра Анна" />
             </div>
             <div>
-               <label className="text-[10px] font-bold text-slate-400 uppercase pl-1">PIN-код (тільки цифри) *</label>
+               <label className="text-[10px] font-bold text-slate-400 uppercase pl-1">PIN-код (4–6 цифр) *</label>
                <input type="text" maxLength="6" value={formData.pin} onChange={e => setFormData({...formData, pin: e.target.value.replace(/\D/g, '')})} className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-teal-400 font-mono text-lg tracking-widest text-center outline-none" placeholder="****" />
             </div>
 
@@ -1349,21 +1421,15 @@ export default function App() {
   const [isLoaded, setIsLoaded] = useState(false);
   const [loadError, setLoadError] = useState(null);
   const [isCheckingPin, setIsCheckingPin] = useState(false);
+  const [pinError, setPinError] = useState('');
 
   const loadData = async (pinForAuth) => {
-    const data = await fetchAllData(pinForAuth);
+    const data = normalizeData(await fetchAllData(pinForAuth));
     dispatch({
       type: 'INIT',
       payload: {
-        materials: data.materials || [],
-        stock: data.stock || [],
-        operations: data.operations || [],
-        expenses: data.expenses || [],
-        subcategories: (data.subcategories && data.subcategories.length > 0) ? data.subcategories : DEFAULT_SUBCATEGORIES,
-        writeoffs: data.writeoffs || [],
-        users: data.users || [],
-        templates: data.templates || [],
-        templateItems: data.templateItems || []
+        ...data,
+        subcategories: data.subcategories.length > 0 ? data.subcategories : DEFAULT_SUBCATEGORIES
       }
     });
   };
@@ -1380,20 +1446,21 @@ export default function App() {
     })();
   }, []);
 
-  const handlePin = async (val) => {
-     const newPin = pin + val;
-     setPin(newPin);
-     if (newPin.length < 4 || isCheckingPin) return;
+  // Перевірка PIN на сервері (Code.gs). PIN може мати 4–6 цифр, тому автоматично він
+  // відправляється лише на 6-й цифрі; для коротших — кнопка OK.
+  const submitPin = async (pinValue) => {
+     if (pinValue.length < PIN_MIN_LENGTH || isCheckingPin) return;
 
      setIsCheckingPin(true);
+     setPinError('');
      try {
        // Звірка PIN тепер на сервері (Code.gs) — сюди більше не тягнемо повний
        // список PIN-кодів наперед, лише результат "хто це і які права".
-       const result = await callAction('login', {}, newPin);
+       const result = await callAction('login', {}, pinValue);
        if (result.success) {
          const foundUser = result.data;
          setCurrentUser(foundUser);
-         setSessionPin(newPin);
+         setSessionPin(pinValue);
          setIsLocked(false);
          setShowAuth(false);
          setPin('');
@@ -1401,17 +1468,35 @@ export default function App() {
          else setActiveTab(foundUser.permissions.includes('postop') ? 'postop' : 'inventory');
          // Довантажуємо повніший зріз даних тепер, коли PIN підтверджено сервером
          // (ІБ пацієнтів для будь-кого залогіненого; реальні PIN-и — лише для admin).
-         loadData(newPin).catch(e => console.error("Не вдалося довантажити дані після входу:", e));
+         loadData(pinValue).catch(e => console.error("Не вдалося довантажити дані після входу:", e));
        } else {
-         setTimeout(() => setPin(''), 300);
+         setPinError(result.error || 'Невірний PIN-код.');
+         setPin('');
        }
      } catch (e) {
        console.error("Помилка перевірки PIN:", e);
-       setTimeout(() => setPin(''), 300);
+       setPinError(e.message || "Немає з'єднання з сервером.");
+       setPin('');
      } finally {
        setIsCheckingPin(false);
      }
   };
+
+  const handlePinDigit = (digit) => {
+     if (isCheckingPin || pin.length >= PIN_MAX_LENGTH) return;
+     const newPin = pin + digit;
+     setPin(newPin);
+     setPinError('');
+     if (newPin.length === PIN_MAX_LENGTH) submitPin(newPin);
+  };
+
+  const handlePinBackspace = () => {
+     if (isCheckingPin) return;
+     setPin(prev => prev.slice(0, -1));
+     setPinError('');
+  };
+
+  const closeAuth = () => { setShowAuth(false); setPin(''); setPinError(''); };
 
   const hasAccess = (tabId) => {
      if (!currentUser) return false;
@@ -1446,14 +1531,18 @@ export default function App() {
            <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 max-w-sm w-full shadow-2xl flex flex-col items-center animate-in zoom-in-95 duration-200">
               <div className="w-16 h-16 bg-slate-800 rounded-2xl flex items-center justify-center mb-6 border border-slate-700 shadow-inner"><Lock size={32} className="text-teal-500"/></div>
               <h2 className="text-xl font-bold text-white mb-6">{isCheckingPin ? 'Перевірка...' : 'Введіть PIN-код'}</h2>
-              <div className="flex gap-4 mb-8">
-                {[0,1,2,3].map(i => <div key={i} className={`w-4 h-4 rounded-full transition-all ${pin.length > i ? 'bg-teal-500 scale-110 shadow-[0_0_10px_rgba(20,184,166,0.5)]' : 'bg-slate-800'}`}></div>)}
+              <div className="flex gap-3 mb-3">
+                {Array.from({ length: PIN_MAX_LENGTH }, (_, i) => i).map(i => <div key={i} className={`w-4 h-4 rounded-full transition-all ${pin.length > i ? 'bg-teal-500 scale-110 shadow-[0_0_10px_rgba(20,184,166,0.5)]' : 'bg-slate-800'}`}></div>)}
               </div>
+              <p className="text-[11px] text-slate-500 mb-5">4–6 цифр, потім натисніть OK</p>
+              {pinError && <p className="text-sm text-rose-400 font-medium mb-5 text-center" role="alert">{pinError}</p>}
               <div className="grid grid-cols-3 gap-4 w-full mb-6">
-                 {[1,2,3,4,5,6,7,8,9].map(num => <button key={num} disabled={isCheckingPin} onClick={()=>handlePin(num.toString())} className="h-16 bg-slate-800 hover:bg-slate-700 rounded-2xl text-2xl font-bold text-white transition-colors shadow-sm disabled:opacity-40">{num}</button>)}
-                 <div className="col-start-2"><button disabled={isCheckingPin} onClick={()=>handlePin('0')} className="h-16 w-full bg-slate-800 hover:bg-slate-700 rounded-2xl text-2xl font-bold text-white transition-colors shadow-sm disabled:opacity-40">0</button></div>
+                 {[1,2,3,4,5,6,7,8,9].map(num => <button key={num} disabled={isCheckingPin} onClick={()=>handlePinDigit(num.toString())} className="h-16 bg-slate-800 hover:bg-slate-700 rounded-2xl text-2xl font-bold text-white transition-colors shadow-sm disabled:opacity-40">{num}</button>)}
+                 <button disabled={isCheckingPin || pin.length === 0} onClick={handlePinBackspace} aria-label="Стерти останню цифру" className="h-16 bg-slate-800 hover:bg-slate-700 rounded-2xl text-2xl font-bold text-slate-300 transition-colors shadow-sm disabled:opacity-40">⌫</button>
+                 <button disabled={isCheckingPin} onClick={()=>handlePinDigit('0')} className="h-16 bg-slate-800 hover:bg-slate-700 rounded-2xl text-2xl font-bold text-white transition-colors shadow-sm disabled:opacity-40">0</button>
+                 <button disabled={isCheckingPin || pin.length < PIN_MIN_LENGTH} onClick={()=>submitPin(pin)} className="h-16 bg-teal-600 hover:bg-teal-500 rounded-2xl text-xl font-black text-white transition-colors shadow-sm disabled:opacity-30 disabled:hover:bg-teal-600">OK</button>
               </div>
-              <button onClick={()=>{setShowAuth(false); setPin('');}} className="text-slate-500 hover:text-white text-sm font-bold">Скасувати</button>
+              <button onClick={closeAuth} className="text-slate-500 hover:text-white text-sm font-bold">Скасувати</button>
            </div>
         </div>
       )}
@@ -1492,12 +1581,14 @@ export default function App() {
 
       <main className="max-w-7xl mx-auto px-4 md:px-8 py-6 md:py-10">
         {isLocked && activeTab !== 'inventory' && setActiveTab('inventory')}
-        {activeTab === 'dashboard' && hasAccess('dashboard') && <Dashboard state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-        {activeTab === 'postop' && hasAccess('postop') && <PostOpExpense state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-        {activeTab === 'stockin' && hasAccess('stockin') && <StockIn state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-        {activeTab === 'catalog' && hasAccess('catalog') && <Catalog state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-        {activeTab === 'inventory' && <Inventory state={state} dispatch={dispatch} isReadOnly={isLocked} sessionPin={sessionPin} />}
-        {activeTab === 'users' && currentUser?.role === 'admin' && <UsersManager state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+        <ErrorBoundary resetKey={activeTab}>
+          {activeTab === 'dashboard' && hasAccess('dashboard') && <Dashboard state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {activeTab === 'postop' && hasAccess('postop') && <PostOpExpense state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {activeTab === 'stockin' && hasAccess('stockin') && <StockIn state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {activeTab === 'catalog' && hasAccess('catalog') && <Catalog state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {activeTab === 'inventory' && <Inventory state={state} dispatch={dispatch} isReadOnly={isLocked} sessionPin={sessionPin} />}
+          {activeTab === 'users' && currentUser?.role === 'admin' && <UsersManager state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+        </ErrorBoundary>
       </main>
 
       {!isLocked && (
