@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
   HeartPulse, ScanBarcode, PackagePlus, Activity, AlertTriangle, Database, Download, CheckCircle,
   X, Search, Trash2, Camera, Calendar, Filter, ArrowDownUp, Lock, Unlock, Edit2, Clock,
-  PieChart as PieChartIcon, BarChart3, Users, Shield, ClipboardList
+  PieChart as PieChartIcon, BarChart3, Users, Shield, ClipboardList, RefreshCw
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import { fetchAllData, callAction as rawCallAction } from './appsScriptClient';
@@ -1433,6 +1433,171 @@ const UsersManager = ({ state, dispatch, sessionPin, currentUser, onSelfUpdated 
 };
 
 // Reducer — чиста функція над локальним станом; персистентність робить Apps Script + Google Sheets
+// ---------- Журнал дій (лише для адміністратора) ----------
+// Дані віддає Code.gs (handleGetAudit_): найновіші записи першими. Пошук і фільтри — на боці клієнта по
+// завантажених записах, щоб кожен символ пошуку не ходив на сервер (кожен запит до Apps Script повільний
+// і входить у спільний ліміт 20 PIN-перевірок на хвилину).
+const AUDIT_PAGE_SIZE = 500;
+const AUDIT_MAX_LIMIT = 2000; // збігається з обмеженням на сервері
+
+const AUDIT_TONES = {
+  teal: 'bg-teal-500/10 text-teal-400 border-teal-500/20',
+  amber: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  rose: 'bg-rose-500/10 text-rose-400 border-rose-500/20',
+  violet: 'bg-violet-500/10 text-violet-300 border-violet-500/20',
+  slate: 'bg-slate-800 text-slate-300 border-slate-700'
+};
+
+// Назва, колір і належність до фільтрів для кожної дії, яку пише Code.gs (logAudit_).
+const AUDIT_ACTIONS = {
+  addStock:          { label: 'Прихід',                 tone: 'teal',   groups: ['stock'] },
+  addOperation:      { label: 'Списання на операцію',   tone: 'teal',   groups: ['stock'] },
+  addWriteoff:       { label: 'Списання зі складу',     tone: 'amber',  groups: ['stock'] },
+  deleteOperation:   { label: 'Видалення операції',     tone: 'rose',   groups: ['delete', 'stock'] },
+  deleteMaterial:    { label: 'Видалення матеріалу',    tone: 'rose',   groups: ['delete'] },
+  deleteSubcategory: { label: 'Видалення підкатегорії', tone: 'rose',   groups: ['delete'] },
+  deleteTemplate:    { label: 'Видалення шаблону',      tone: 'rose',   groups: ['delete'] },
+  saveUser:          { label: 'Зміна користувача',      tone: 'violet', groups: ['users'] },
+  deleteUser:        { label: 'Видалення користувача',  tone: 'rose',   groups: ['delete', 'users'] }
+};
+
+const AUDIT_FILTERS = [
+  { id: 'all', label: 'Усі дії' },
+  { id: 'delete', label: 'Видалення' },
+  { id: 'stock', label: 'Рух складу' },
+  { id: 'users', label: 'Користувачі' }
+];
+
+// "2026-10-13 09:15:02" -> "13.10.2026 09:15:02"
+const formatAuditTime = (ts) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(str(ts));
+  return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}` : str(ts);
+};
+
+const AuditLogViewer = ({ sessionPin }) => {
+  const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [limit, setLimit] = useState(AUDIT_PAGE_SIZE);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all');
+  const requestId = useRef(0);
+
+  const load = useCallback(async (wantedLimit) => {
+    const myId = ++requestId.current;
+    setIsLoading(true);
+    setError('');
+    try {
+      const result = await callAction('getAudit', { limit: wantedLimit }, sessionPin);
+      if (myId !== requestId.current) return; // прийшла застаріла відповідь — ігноруємо
+      if (!result.success) { setError(result.error || 'Не вдалося завантажити журнал.'); return; }
+      setRows(result.data.rows || []);
+      setTotal(result.data.total || 0);
+      setLimit(wantedLimit);
+    } catch (e) {
+      if (myId !== requestId.current) return;
+      console.error(e);
+      setError(e.message || "Немає з'єднання з сервером.");
+    } finally {
+      if (myId === requestId.current) setIsLoading(false);
+    }
+  }, [sessionPin]);
+
+  useEffect(() => { load(AUDIT_PAGE_SIZE); }, [load]);
+
+  const filtered = useMemo(() => {
+    const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
+    return rows.filter(r => {
+      const info = AUDIT_ACTIONS[r.action];
+      if (filter !== 'all' && !(info && info.groups.includes(filter))) return false;
+      if (terms.length === 0) return true;
+      // Усі слова пошуку мають зустрітися (в будь-якому порядку): "оля 0042" знайде дії Олі з операцією 0042.
+      const haystack = `${formatAuditTime(r.timestamp)} ${str(r.timestamp)} ${str(r.user_name)} ${info ? info.label : str(r.action)} ${str(r.details)}`.toLowerCase();
+      return terms.every(t => haystack.includes(t));
+    });
+  }, [rows, search, filter]);
+
+  const hasMoreOnServer = rows.length < total;
+  const canLoadMore = hasMoreOnServer && limit < AUDIT_MAX_LIMIT;
+  const olderOnlyInSheet = hasMoreOnServer && limit >= AUDIT_MAX_LIMIT;
+
+  return (
+    <div className="animate-in slide-in-from-bottom-4 duration-500 space-y-6">
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 md:p-6 shadow-xl space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-lg font-bold text-white flex items-center gap-2"><ClipboardList className="text-teal-500" /> Журнал дій</h3>
+            <p className="text-xs text-slate-500 mt-1">Хто, коли і що змінив у системі. Найновіші записи — зверху.</p>
+          </div>
+          <button onClick={() => load(limit)} disabled={isLoading} aria-label="Оновити журнал" className="shrink-0 p-2.5 bg-slate-950 border border-slate-800 text-slate-400 hover:text-teal-400 rounded-xl disabled:opacity-50 transition-colors">
+            <RefreshCw size={18} className={isLoading ? 'animate-spin' : ''} />
+          </button>
+        </div>
+        <div className="flex flex-col md:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500" />
+            <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Пошук: людина, № операції, ІБ, матеріал, LOT..." className="w-full bg-slate-950 border border-slate-800 rounded-xl py-3 pl-10 pr-3 text-white outline-none text-sm" />
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            {AUDIT_FILTERS.map(f => (
+              <button key={f.id} onClick={() => setFilter(f.id)} aria-pressed={filter === f.id} className={`px-3.5 py-2.5 rounded-xl text-xs font-bold border transition-colors ${filter === f.id ? 'bg-teal-500/10 text-teal-400 border-teal-500/30' : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'}`}>{f.label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-rose-950/30 border border-rose-900/50 rounded-3xl p-5 flex items-center justify-between gap-3" role="alert">
+          <div className="flex items-center gap-3 text-rose-400 text-sm font-medium"><AlertTriangle size={18} className="shrink-0" /> {error}</div>
+          <button onClick={() => load(limit)} className="shrink-0 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold px-4 py-2 rounded-xl">Повторити</button>
+        </div>
+      )}
+
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl shadow-xl overflow-hidden">
+        <div className="hidden md:grid md:grid-cols-[150px_170px_210px_1fr] gap-4 px-5 py-3 bg-slate-950 text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+          <div>Час</div><div>Хто</div><div>Дія</div><div>Деталі</div>
+        </div>
+        {isLoading && rows.length === 0 ? (
+          <div className="p-10 text-center text-slate-500 text-sm font-medium">Завантаження журналу...</div>
+        ) : filtered.length === 0 ? (
+          <div className="p-10 text-center text-slate-500 text-sm font-medium">
+            {rows.length === 0 && !error ? 'Журнал поки порожній.' : (rows.length === 0 ? '' : 'Нічого не знайдено за цими умовами.')}
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-800">
+            {filtered.map(r => {
+              const info = AUDIT_ACTIONS[r.action];
+              return (
+                <div key={r.id} className="px-5 py-3.5 md:grid md:grid-cols-[150px_170px_210px_1fr] md:gap-4 md:items-start hover:bg-slate-800/30 transition-colors">
+                  <div className="text-[11px] text-slate-500 font-mono">{formatAuditTime(r.timestamp)}</div>
+                  <div className="text-sm font-bold text-white mt-0.5 md:mt-0">{str(r.user_name) || '—'}</div>
+                  <div className="mt-1.5 md:mt-0">
+                    <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-md border ${AUDIT_TONES[info ? info.tone : 'slate']}`}>{info ? info.label : str(r.action)}</span>
+                  </div>
+                  <div className="text-sm text-slate-300 break-words mt-1.5 md:mt-0">{str(r.details)}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 px-1">
+        <p className="text-xs text-slate-500">
+          Показано <span className="text-slate-300 font-bold">{filtered.length}</span> із {rows.length} завантажених · усього в журналі: {total}
+        </p>
+        {canLoadMore && (
+          <button onClick={() => load(Math.min(limit + AUDIT_PAGE_SIZE, AUDIT_MAX_LIMIT))} disabled={isLoading} className="bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold px-5 py-2.5 rounded-xl disabled:opacity-50">Завантажити ще</button>
+        )}
+        {olderOnlyInSheet && (
+          <p className="text-xs text-slate-500">Старіші записи доступні в листі AuditLog у Google Таблиці.</p>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const reducer = (state, action) => {
   switch (action.type) {
     case 'INIT': return action.payload;
@@ -1671,6 +1836,9 @@ export default function App() {
                   {currentUser?.role === 'admin' && (
                      <button onClick={() => setActiveTab('users')} className={`px-5 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${activeTab === 'users' ? 'bg-teal-900/30 text-teal-400 border border-teal-500/30 shadow-lg' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}`}><Users size={16}/></button>
                   )}
+                  {currentUser?.role === 'admin' && (
+                     <button onClick={() => setActiveTab('audit')} aria-label="Журнал дій" title="Журнал дій" className={`px-5 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${activeTab === 'audit' ? 'bg-teal-900/30 text-teal-400 border border-teal-500/30 shadow-lg' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}`}><ClipboardList size={16}/></button>
+                  )}
                </div>
              )}
              <button onClick={()=>{
@@ -1694,6 +1862,7 @@ export default function App() {
           {currentTab === 'catalog' && hasAccess('catalog') && <Catalog state={state} dispatch={dispatch} sessionPin={sessionPin} />}
           {currentTab === 'inventory' && <Inventory state={state} dispatch={dispatch} isReadOnly={isLocked} sessionPin={sessionPin} />}
           {currentTab === 'users' && currentUser?.role === 'admin' && <UsersManager state={state} dispatch={dispatch} sessionPin={sessionPin} currentUser={currentUser} onSelfUpdated={handleSelfUpdated} />}
+          {currentTab === 'audit' && currentUser?.role === 'admin' && <AuditLogViewer sessionPin={sessionPin} />}
         </ErrorBoundary>
       </main>
 
@@ -1710,6 +1879,7 @@ export default function App() {
             <button onClick={() => setActiveTab('inventory')} aria-label="Склад" className={`flex flex-col items-center gap-1.5 ${activeTab==='inventory'?'text-teal-400':'text-slate-500'}`}><Database size={22}/></button>
             {hasAccess('catalog') && <button onClick={() => setActiveTab('catalog')} aria-label="Довідник" className={`flex flex-col items-center gap-1.5 ${activeTab==='catalog'?'text-teal-400':'text-slate-500'}`}><Edit2 size={22}/></button>}
             {currentUser?.role === 'admin' && <button onClick={() => setActiveTab('users')} aria-label="Користувачі" className={`flex flex-col items-center gap-1.5 ${activeTab==='users'?'text-teal-400':'text-slate-500'}`}><Users size={22}/></button>}
+            {currentUser?.role === 'admin' && <button onClick={() => setActiveTab('audit')} aria-label="Журнал дій" className={`flex flex-col items-center gap-1.5 ${activeTab==='audit'?'text-teal-400':'text-slate-500'}`}><ClipboardList size={22}/></button>}
           </div>
         </nav>
       )}
