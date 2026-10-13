@@ -5,7 +5,22 @@ import {
   PieChart as PieChartIcon, BarChart3, Users, Shield, ClipboardList
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
-import { fetchAllData, callAction } from './appsScriptClient';
+import { fetchAllData, callAction as rawCallAction } from './appsScriptClient';
+
+// Сервер відповідає цим текстом (Code.gs, authorize_), коли PIN поточної сесії більше не існує:
+// адмін змінив PIN або видалив обліковий запис. Тоді сесію треба завершити, а не лишати
+// користувача з "мертвими" кнопками, які щоразу дають помилку.
+const INVALID_PIN_ERROR = 'Невірний PIN-код.';
+let sessionInvalidHandler = null; // реєструє компонент App
+
+const callAction = async (action, payload, pin) => {
+  const result = await rawCallAction(action, payload, pin);
+  // Для самого входу ('login') "Невірний PIN" — звичайна відповідь, а не втрата сесії.
+  if (result && result.success === false && result.error === INVALID_PIN_ERROR && pin && action !== 'login' && sessionInvalidHandler) {
+    sessionInvalidHandler();
+  }
+  return result;
+};
 
 const DEFAULT_SUBCATEGORIES = [
   { id: 'sc1', name: 'Клапани АК' },
@@ -72,6 +87,33 @@ class ErrorBoundary extends React.Component {
     );
   }
 }
+
+// Підтвердження небезпечних дій (видалення) замість одного випадкового тапу.
+// Використання: const [askConfirm, confirmDialog] = useConfirm();
+//   if (!(await askConfirm({ title, message, confirmLabel }))) return;   ...   {confirmDialog}
+const useConfirm = () => {
+  const [request, setRequest] = useState(null);
+  const askConfirm = useCallback((options) => new Promise((resolve) => setRequest({ ...options, resolve })), []);
+  const answer = (result) => { if (request) request.resolve(result); setRequest(null); };
+  const confirmDialog = request ? (
+    <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-sm z-[70] flex justify-center items-center p-4" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div className="bg-slate-900 border border-slate-700 rounded-3xl w-full max-w-md shadow-2xl p-6 space-y-5">
+        <div className="flex items-start gap-3">
+          <AlertTriangle className="text-rose-500 shrink-0 mt-0.5" size={24} />
+          <div>
+            <h3 id="confirm-title" className="text-lg font-bold text-white">{request.title}</h3>
+            {request.message && <p className="text-sm text-slate-400 mt-2 whitespace-pre-line">{request.message}</p>}
+          </div>
+        </div>
+        <div className="flex gap-3">
+          <button autoFocus onClick={() => answer(false)} className="flex-1 bg-slate-800 hover:bg-slate-700 text-white font-bold py-3 rounded-xl">Скасувати</button>
+          <button onClick={() => answer(true)} className="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-bold py-3 rounded-xl">{request.confirmLabel || 'Видалити'}</button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+  return [askConfirm, confirmDialog];
+};
 
 const parseBarcode = (code) => {
   let cleanCode = code.replace(/\\u001d|\\x1d|<GS>|\]d2/gi, String.fromCharCode(29));
@@ -196,6 +238,7 @@ const BarcodeScanner = ({ onScan, onClose }) => {
 };
 
 const Dashboard = ({ state, dispatch, sessionPin }) => {
+  const [askConfirm, confirmDialog] = useConfirm();
   const [selectedOp, setSelectedOp] = useState(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -235,6 +278,13 @@ const Dashboard = ({ state, dispatch, sessionPin }) => {
 
   const handleDeleteOp = async () => {
     if (isDeleting) return;
+    const linesCount = state.expenses.filter(e => e.operation_id === selectedOp.id).length;
+    const confirmed = await askConfirm({
+      title: `Видалити операцію ${selectedOp.operation_num}?`,
+      message: `Запис про операцію зникне, а списані матеріали (${linesCount} поз.) повернуться на склад.\nДію буде записано в журнал.`,
+      confirmLabel: 'Видалити операцію'
+    });
+    if (!confirmed) return;
     setIsDeleting(true);
     try {
       const result = await callAction('deleteOperation', { operationId: selectedOp.id }, sessionPin);
@@ -366,6 +416,7 @@ const Dashboard = ({ state, dispatch, sessionPin }) => {
           </div>
         </div>
       )}
+      {confirmDialog}
     </div>
   );
 };
@@ -427,6 +478,7 @@ const SearchableDropdown = ({ state, onSelect }) => {
 };
 
 const TemplateManagerModal = ({ state, dispatch, sessionPin, onClose }) => {
+  const [askConfirm, confirmDialog] = useConfirm();
   const [editingId, setEditingId] = useState(null);
   const [name, setName] = useState('');
   const [operationType, setOperationType] = useState('CABG On-pump');
@@ -507,6 +559,12 @@ const TemplateManagerModal = ({ state, dispatch, sessionPin, onClose }) => {
   };
 
   const handleDelete = async (id) => {
+    const tplToDelete = state.templates.find(t => t.id === id);
+    const confirmed = await askConfirm({
+      title: `Видалити шаблон «${tplToDelete ? tplToDelete.name : ''}»?`,
+      message: 'Шаблон буде видалено разом з усіма його пунктами. Дію буде записано в журнал.'
+    });
+    if (!confirmed) return;
     setIsDeleting(id);
     try {
       const result = await callAction('deleteTemplate', { id }, sessionPin);
@@ -610,6 +668,7 @@ const TemplateManagerModal = ({ state, dispatch, sessionPin, onClose }) => {
           </div>
         </div>
       </div>
+      {confirmDialog}
     </div>
   );
 };
@@ -948,6 +1007,7 @@ const StockIn = ({ state, dispatch, sessionPin }) => {
 };
 
 const Catalog = ({ state, dispatch, sessionPin }) => {
+  const [askConfirm, confirmDialog] = useConfirm();
   const [showScanner, setShowScanner] = useState(false);
   const [showSubcatModal, setShowSubcatModal] = useState(false);
   const [newSubcat, setNewSubcat] = useState('');
@@ -973,6 +1033,12 @@ const Catalog = ({ state, dispatch, sessionPin }) => {
   };
   const handleDelete = async (id) => {
      if(state.stock.some(s => s.material_id === id)) { alert("Неможливо видалити: матеріал має залишки на складі або історію."); return; }
+     const matToDelete = state.materials.find(m => m.id === id);
+     const confirmed = await askConfirm({
+       title: `Видалити матеріал «${matToDelete ? matToDelete.name : ''}»?`,
+       message: 'Матеріал буде видалено з довідника. Це неможливо скасувати. Дію буде записано в журнал.'
+     });
+     if (!confirmed) return;
      try {
        const result = await callAction('deleteMaterial', { id }, sessionPin);
        if (!result.success) { alert(result.error || "Помилка видалення"); return; }
@@ -997,6 +1063,12 @@ const Catalog = ({ state, dispatch, sessionPin }) => {
      finally { setIsAddingSubcat(false); }
   };
   const handleDeleteSubcat = async (id) => {
+      const subToDelete = (state.subcategories || []).find(sc => sc.id === id);
+      const confirmed = await askConfirm({
+        title: `Видалити підкатегорію «${subToDelete ? subToDelete.name : ''}»?`,
+        message: 'Підкатегорію буде видалено зі списку. Дію буде записано в журнал.'
+      });
+      if (!confirmed) return;
       try {
         const result = await callAction('deleteSubcategory', { id }, sessionPin);
         if (!result.success) { alert(result.error || "Помилка видалення підкатегорії"); return; }
@@ -1061,6 +1133,7 @@ const Catalog = ({ state, dispatch, sessionPin }) => {
             </tbody></table>
         </div>
       </div>
+      {confirmDialog}
     </div>
   );
 };
@@ -1236,7 +1309,8 @@ const Inventory = ({ state, dispatch, isReadOnly, sessionPin }) => {
   );
 };
 
-const UsersManager = ({ state, dispatch, sessionPin }) => {
+const UsersManager = ({ state, dispatch, sessionPin, currentUser, onSelfUpdated }) => {
+  const [askConfirm, confirmDialog] = useConfirm();
   const [formData, setFormData] = useState({ id: '', name: '', pin: '', role: 'user', permissions: ['inventory'] });
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -1267,6 +1341,9 @@ const UsersManager = ({ state, dispatch, sessionPin }) => {
       if (!result.success) { alert(result.error || "Помилка збереження користувача"); return; }
       if (isEditing) dispatch({ type: 'UPDATE_USER', payload: result.data });
       else dispatch({ type: 'ADD_USER', payload: result.data });
+      // Адмін змінив власний запис (PIN чи ім'я): оновлюємо сесію, інакше наступні запити
+      // підуть зі старим PIN і сервер їх відхилить.
+      if (isEditing && currentUser && result.data.id === currentUser.id && onSelfUpdated) onSelfUpdated(result.data);
 
       setFormData({ id: '', name: '', pin: '', role: 'user', permissions: ['inventory'] });
       setIsEditing(false);
@@ -1275,6 +1352,12 @@ const UsersManager = ({ state, dispatch, sessionPin }) => {
   };
 
   const handleDelete = async (id) => {
+    const userToDelete = state.users.find(u => u.id === id);
+    const confirmed = await askConfirm({
+      title: `Видалити користувача «${userToDelete ? userToDelete.name : ''}»?`,
+      message: 'Користувач одразу втратить доступ. Дію буде записано в журнал.'
+    });
+    if (!confirmed) return;
     try {
       const result = await callAction('deleteUser', { id }, sessionPin);
       if (!result.success) { alert(result.error || "Помилка видалення користувача"); return; }
@@ -1344,6 +1427,7 @@ const UsersManager = ({ state, dispatch, sessionPin }) => {
           </table>
         </div>
       </div>
+      {confirmDialog}
     </div>
   );
 };
@@ -1446,6 +1530,25 @@ export default function App() {
     })();
   }, []);
 
+  // Завершення сесії, коли сервер каже, що PIN більше недійсний (його змінив адмін / обліковий запис видалено).
+  useEffect(() => {
+    sessionInvalidHandler = () => {
+      setIsLocked(true); setCurrentUser(null); setSessionPin(''); setActiveTab('inventory');
+      setPin('');
+      setPinError('Сесію завершено: ваш PIN змінено або обліковий запис видалено. Увійдіть знову.');
+      setShowAuth(true);
+      loadData().catch(e => console.error("Не вдалося оновити дані після завершення сесії:", e));
+    };
+    return () => { sessionInvalidHandler = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Адмін змінив власний запис: оновлюємо PIN сесії та дані користувача (інакше всі наступні запити впадуть).
+  const handleSelfUpdated = (u) => {
+    setSessionPin(u.pin);
+    setCurrentUser({ id: u.id, name: u.name, role: u.role, permissions: u.permissions || [] });
+  };
+
   // Перевірка PIN на сервері (Code.gs). PIN може мати 4–6 цифр, тому автоматично він
   // відправляється лише на 6-й цифрі; для коротших — кнопка OK.
   const submitPin = async (pinValue) => {
@@ -1504,6 +1607,10 @@ export default function App() {
      if (tabId === 'inventory') return true;
      return currentUser.permissions.includes(tabId);
   };
+
+  // Без входу доступна лише вкладка "Склад". Обчислюємо її тут, а не оновлюємо стан під час
+  // рендеру (як було раніше): у JSX більше немає побічних ефектів.
+  const currentTab = (isLocked && activeTab !== 'inventory') ? 'inventory' : activeTab;
 
   if (loadError) {
     return (
@@ -1580,29 +1687,29 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 md:px-8 py-6 md:py-10">
-        {isLocked && activeTab !== 'inventory' && setActiveTab('inventory')}
-        <ErrorBoundary resetKey={activeTab}>
-          {activeTab === 'dashboard' && hasAccess('dashboard') && <Dashboard state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-          {activeTab === 'postop' && hasAccess('postop') && <PostOpExpense state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-          {activeTab === 'stockin' && hasAccess('stockin') && <StockIn state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-          {activeTab === 'catalog' && hasAccess('catalog') && <Catalog state={state} dispatch={dispatch} sessionPin={sessionPin} />}
-          {activeTab === 'inventory' && <Inventory state={state} dispatch={dispatch} isReadOnly={isLocked} sessionPin={sessionPin} />}
-          {activeTab === 'users' && currentUser?.role === 'admin' && <UsersManager state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+        <ErrorBoundary resetKey={currentTab}>
+          {currentTab === 'dashboard' && hasAccess('dashboard') && <Dashboard state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {currentTab === 'postop' && hasAccess('postop') && <PostOpExpense state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {currentTab === 'stockin' && hasAccess('stockin') && <StockIn state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {currentTab === 'catalog' && hasAccess('catalog') && <Catalog state={state} dispatch={dispatch} sessionPin={sessionPin} />}
+          {currentTab === 'inventory' && <Inventory state={state} dispatch={dispatch} isReadOnly={isLocked} sessionPin={sessionPin} />}
+          {currentTab === 'users' && currentUser?.role === 'admin' && <UsersManager state={state} dispatch={dispatch} sessionPin={sessionPin} currentUser={currentUser} onSelfUpdated={handleSelfUpdated} />}
         </ErrorBoundary>
       </main>
 
       {!isLocked && (
         <nav className="md:hidden fixed bottom-0 w-full bg-slate-950/90 backdrop-blur-lg border-t border-slate-800 pb-safe z-40">
           <div className="flex justify-around items-center h-20 px-2">
-            {hasAccess('dashboard') && <button onClick={() => setActiveTab('dashboard')} className={`flex flex-col items-center gap-1.5 ${activeTab==='dashboard'?'text-teal-400':'text-slate-500'}`}><Activity size={22}/></button>}
-            {hasAccess('stockin') && <button onClick={() => setActiveTab('stockin')} className={`flex flex-col items-center gap-1.5 ${activeTab==='stockin'?'text-teal-400':'text-slate-500'}`}><PackagePlus size={22}/></button>}
+            {hasAccess('dashboard') && <button onClick={() => setActiveTab('dashboard')} aria-label="Дашборд" className={`flex flex-col items-center gap-1.5 ${activeTab==='dashboard'?'text-teal-400':'text-slate-500'}`}><Activity size={22}/></button>}
+            {hasAccess('stockin') && <button onClick={() => setActiveTab('stockin')} aria-label="Прихід" className={`flex flex-col items-center gap-1.5 ${activeTab==='stockin'?'text-teal-400':'text-slate-500'}`}><PackagePlus size={22}/></button>}
 
             {hasAccess('postop') && (
-               <div className="relative -top-6"><button onClick={() => setActiveTab('postop')} className={`h-16 w-16 rounded-full flex items-center justify-center shadow-lg border-4 border-[#020817] ${activeTab==='postop'?'bg-teal-400 text-slate-950':'bg-slate-800 text-teal-400'}`}><HeartPulse size={28} strokeWidth={2.5}/></button></div>
+               <div className="relative -top-6"><button onClick={() => setActiveTab('postop')} aria-label="Списання на операцію" className={`h-16 w-16 rounded-full flex items-center justify-center shadow-lg border-4 border-[#020817] ${activeTab==='postop'?'bg-teal-400 text-slate-950':'bg-slate-800 text-teal-400'}`}><HeartPulse size={28} strokeWidth={2.5}/></button></div>
             )}
 
-            <button onClick={() => setActiveTab('inventory')} className={`flex flex-col items-center gap-1.5 ${activeTab==='inventory'?'text-teal-400':'text-slate-500'}`}><Database size={22}/></button>
-            {hasAccess('catalog') && <button onClick={() => setActiveTab('catalog')} className={`flex flex-col items-center gap-1.5 ${activeTab==='catalog'?'text-teal-400':'text-slate-500'}`}><Edit2 size={22}/></button>}
+            <button onClick={() => setActiveTab('inventory')} aria-label="Склад" className={`flex flex-col items-center gap-1.5 ${activeTab==='inventory'?'text-teal-400':'text-slate-500'}`}><Database size={22}/></button>
+            {hasAccess('catalog') && <button onClick={() => setActiveTab('catalog')} aria-label="Довідник" className={`flex flex-col items-center gap-1.5 ${activeTab==='catalog'?'text-teal-400':'text-slate-500'}`}><Edit2 size={22}/></button>}
+            {currentUser?.role === 'admin' && <button onClick={() => setActiveTab('users')} aria-label="Користувачі" className={`flex flex-col items-center gap-1.5 ${activeTab==='users'?'text-teal-400':'text-slate-500'}`}><Users size={22}/></button>}
           </div>
         </nav>
       )}
